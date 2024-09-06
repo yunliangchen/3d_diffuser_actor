@@ -235,8 +235,8 @@ class Encoder(nn.Module):
         instr_dummy_pos = self.relative_pe_layer(instr_dummy_pos)
         return instr_feats, instr_dummy_pos
 
-    def run_fps(self, context_features, context_pos):
-        # context_features (Np, B, F)
+    def run_fps(self, context_features, context_pos, return_sampled_inds=False):
+        # context_features (Np, B, F) (1024*ncam, B, 192)
         # context_pos (B, Np, F, 2)
         # outputs of analogous shape, with smaller Np
         npts, bs, ch = context_features.shape
@@ -251,7 +251,7 @@ class Encoder(nn.Module):
         ).long()
 
         # Sample features
-        expanded_sampled_inds = sampled_inds.unsqueeze(-1).expand(-1, -1, ch)
+        expanded_sampled_inds = sampled_inds.unsqueeze(-1).expand(-1, -1, ch) # (B, npts, F)
         sampled_context_features = torch.gather(
             context_features,
             0,
@@ -266,7 +266,12 @@ class Encoder(nn.Module):
         sampled_context_pos = torch.gather(
             context_pos, 1, expanded_sampled_inds
         )
-        return sampled_context_features, sampled_context_pos
+        if not return_sampled_inds:
+            return sampled_context_features, sampled_context_pos
+        else:
+            # sampled_inds: (B, 1024), expanded_sampled_inds: (B, 1024, 192, 2) 
+            # sampled_context_features: (1024, B, 192), sampled_context_pos: (B, 1024, 192, 2)
+            return sampled_context_features, sampled_context_pos, sampled_inds
 
     def vision_language_attention(self, feats, instr_feats):
         feats, _ = self.vl_attention[0](

@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 
-from datasets.dataset_engine import RLBenchDataset
+# from datasets.dataset_engine import RLBenchDataset
 from engine import BaseTrainTester
 from diffuser_actor import DiffuserActor
 
@@ -29,7 +29,7 @@ class Arguments(tap.Tap):
     max_episodes_per_task: int = 100
     instructions: Optional[Path] = "instructions.pkl"
     seed: int = 0
-    tasks: Tuple[str, ...]
+    tasks: Tuple[str, ...] = None
     variations: Tuple[int, ...] = (0,)
     checkpoint: Optional[Path] = None
     accumulate_grad_batches: int = 1
@@ -39,8 +39,8 @@ class Arguments(tap.Tap):
     eval_only: int = 0
 
     # Training and validation datasets
-    dataset: Path
-    valset: Path
+    dataset: Path = None
+    valset: Path = None
     dense_interpolation: int = 0
     interpolation_length: int = 100
 
@@ -155,7 +155,8 @@ class TrainTester(BaseTrainTester):
             diffusion_timesteps=self.args.diffusion_timesteps,
             nhist=self.args.num_history,
             relative=bool(self.args.relative_action),
-            lang_enhanced=bool(self.args.lang_enhanced)
+            lang_enhanced=bool(self.args.lang_enhanced),
+            use_preenc_language=bool(self.args.use_preenc_language),
         )
         print("Model parameters:", count_parameters(_model))
 
@@ -264,7 +265,15 @@ class TrainTester(BaseTrainTester):
             # Generate visualizations
             if i == 0 and dist.get_rank() == 0 and step_id > -1:
                 viz_key = f'{split}-viz/viz'
-                viz = generate_visualizations(
+                # viz = generate_visualizations(
+                #     action,
+                #     sample["trajectory"].to(device),
+                #     sample["trajectory_mask"].to(device)
+                # )
+                viz = generate_visualizations_with_pcd(
+                    sample["pcds"].to(device),
+                    sample["rgbs"].to(device),
+                    curr_gripper.to(device),
                     action,
                     sample["trajectory"].to(device),
                     sample["trajectory_mask"].to(device)
@@ -327,7 +336,7 @@ class TrajectoryCriterion:
         select_mask = (quat_l1 < quat_l1_).float()
         quat_l1 = (select_mask * quat_l1 + (1 - select_mask) * quat_l1_)
         # gripper openess
-        openess = ((pred[..., 7:] >= 0.5) == (gt[..., 7:] > 0.0)).bool()
+        openess = ((pred[..., 7:] >= 0.5) == (gt[..., 7:] > 0.5)).bool()
         tr = 'traj_'
 
         # Trajectory metrics
@@ -407,6 +416,78 @@ def generate_visualizations(pred, gt, mask, box_size=0.3):
     img = fig_to_numpy(fig, dpi=120)
     plt.close()
     return img.transpose(2, 0, 1)
+
+
+def generate_visualizations_with_pcd(visible_pcd, visible_rgb, curr_gripper, pred, gt, mask, box_size=0.3):
+    """Visualize by plotting the point clouds and gripper pose.
+
+    Args:
+        visible_pcd: An array of shape (B, ncam, 3, H, W)
+        visible_rgb: An array of shape (B, ncam, 3, H, W)
+        curr_gripper: An array of shape (B, nhist, 8)
+    """
+    batch_idx = 0
+    cur_vis_pcd = visible_pcd[batch_idx].permute(0, 2, 3, 1)[:1].reshape(-1, 3).detach().cpu().numpy() # (ncam * H * W, 3)
+    cur_vis_rgb = visible_rgb[batch_idx].permute(0, 2, 3, 1)[:1].reshape(-1, 3).detach().cpu().numpy()#[..., ::-1] # (ncam * H * W, 3)
+    curr_gripper = curr_gripper[batch_idx, -1].detach().cpu().numpy()
+    rand_inds = np.random.choice(cur_vis_pcd.shape[0], 20000, replace=False)
+    mask_ = (
+            (cur_vis_pcd[rand_inds, 2] >= -0.1) &
+            (cur_vis_pcd[rand_inds, 2] <= 0.7) &
+            (cur_vis_pcd[rand_inds, 1] >= -1) &
+            (cur_vis_pcd[rand_inds, 1] <= 1) &
+            (cur_vis_pcd[rand_inds, 0] >= -0.1) &
+            (cur_vis_pcd[rand_inds, 0] <= 1.3)
+        )
+    rand_inds = rand_inds[mask_]
+    
+    pred = pred[batch_idx].detach().cpu().numpy()
+    gt = gt[batch_idx].detach().cpu().numpy()
+    mask = mask[batch_idx].detach().cpu().numpy()
+
+    fig = plt.figure(figsize=(10, 10))
+    ax = plt.axes(projection='3d')
+    ax.scatter3D(
+        pred[~mask][:, 0], pred[~mask][:, 1], pred[~mask][:, 2],
+        color='red', label='pred', s=60
+    )
+    ax.scatter3D(
+        gt[~mask][:, 0], gt[~mask][:, 1], gt[~mask][:, 2],
+        color='blue', label='gt', s=60
+    )
+
+    ax.scatter(cur_vis_pcd[rand_inds, 0],
+               cur_vis_pcd[rand_inds, 1],
+               cur_vis_pcd[rand_inds, 2],
+               c=np.clip(cur_vis_rgb[rand_inds], 0, 1), s=12)
+    # plot the origin
+    ax.scatter(0, 0, 0, c='g', s=130)
+    # plot the gripper pose
+    ax.scatter(curr_gripper[0], curr_gripper[1], curr_gripper[2], c='y', s=200)
+
+    center = gt[~mask].mean(0)
+    ax.view_init(elev=20, azim=135, roll=0)
+    ax.set_xlim(center[0] - box_size, center[0] + box_size)
+    ax.set_ylim(center[1] - box_size, center[1] + box_size)
+    ax.set_zlim(center[2] - box_size, center[2] + box_size)
+    # ax.set_ylim([-0.6, 0.6])
+    # ax.set_xlim([0, 1.1])
+    # ax.set_zlim([-0.1, 0.7])
+    # add axes label
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+    ax.set_zticklabels([])
+    plt.legend()
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+
+    img = fig_to_numpy(fig, dpi=120)
+    plt.close()
+    return img.transpose(2, 0, 1)
+
+
 
 
 if __name__ == '__main__':

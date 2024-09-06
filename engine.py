@@ -137,7 +137,7 @@ class BaseTrainTester:
                 model, criterion, test_loader, step_id=-1,
                 val_iters=max(
                     5,
-                    int(4 * len(self.args.tasks)/self.args.batch_size_val)
+                    int(4 * 20/self.args.batch_size_val)
                 )
             )
             return model
@@ -160,7 +160,7 @@ class BaseTrainTester:
                     model, criterion, train_loader, step_id,
                     val_iters=max(
                         5,
-                        int(4 * len(self.args.tasks)/self.args.batch_size_val)
+                        int(4 * 20/self.args.batch_size_val)
                     ),
                     split='train'
                 )
@@ -170,7 +170,7 @@ class BaseTrainTester:
                     model, criterion, test_loader, step_id,
                     val_iters=max(
                         5,
-                        int(4 * len(self.args.tasks)/self.args.batch_size_val)
+                        int(4 * 20/self.args.batch_size_val)
                     )
                 )
                 if dist.get_rank() == 0:  # save model
@@ -192,11 +192,14 @@ class BaseTrainTester:
         """Run a given number of evaluation steps."""
         return None
 
-    def load_checkpoint(self, model, optimizer):
+    def load_checkpoint(self, model, optimizer, use_ddp=True):
         """Load from checkpoint."""
         print("=> loading checkpoint '{}'".format(self.args.checkpoint))
 
         model_dict = torch.load(self.args.checkpoint, map_location="cpu")
+        if not use_ddp:
+            # Remove 'module.' prefix
+            torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(model_dict["weight"], 'module.')
         model.load_state_dict(model_dict["weight"])
         if 'optimizer' in model_dict:
             optimizer.load_state_dict(model_dict["optimizer"])

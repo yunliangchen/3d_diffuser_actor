@@ -75,6 +75,13 @@ class DiffuserActor(nn.Module):
         )
         self.n_steps = diffusion_timesteps
         self.gripper_loc_bounds = torch.tensor(gripper_loc_bounds)
+        # Camera ids
+        # self.camera_ids = nn.Embedding(5, embedding_dim)
+        # Positional embeddings
+        self.pos_embed_2d = nn.Embedding(32 * 32, embedding_dim)
+        # Encode current gripper
+        self.curr_gripper_feat = nn.Linear(9, embedding_dim)
+
         # Initialize tokenizer and language model only if needed
         self._lang_model = None
         self._tokenizer = None
@@ -93,27 +100,39 @@ class DiffuserActor(nn.Module):
             p.requires_grad = False
 
     def encode_inputs(self, visible_rgb, visible_pcd, instruction,
-                      curr_gripper, return_sampled_inds=False):
+                      curr_gripper):
         # Compute visual features/positional embeddings at different scales
-        rgb_feats_pyramid, pcd_pyramid = self.encoder.encode_images(
+        rgb_feats_pyramid, _ = self.encoder.encode_images(
             visible_rgb, visible_pcd
         )
         # Keep only low-res scale
+        context_feats = rgb_feats_pyramid[0]  # b ncam c h w
         context_feats = einops.rearrange(
-            rgb_feats_pyramid[0],
-            "b ncam c h w -> b (ncam h w) c"
+            context_feats,
+            "b ncam c h w -> b ncam c (h w)"
         )
-        context = pcd_pyramid[0]
+        context_feats = (  # add camera id embeddings
+            context_feats
+            # + self.camera_ids.weight[:context_feats.size(1)][None, :, :, None]
+            + self.pos_embed_2d.weight[
+                :context_feats.size(-1)
+            ].transpose(0, 1)[None, None]
+        )
+        context_feats = einops.rearrange(
+            context_feats,
+            "b ncam c L -> b (ncam L) c"
+        )
+
         # Encode instruction (B, 53, F)
         instr_feats = None
         if self.use_instruction:
             if not self.use_preenc_language:
                 # instruction now is a list of str
                 if self._lang_model is None:
-                    self._load_lang_encoder(device=context.device)
+                    self._load_lang_encoder(device=context_feats.device)
                 tokens = torch.tensor(self._tokenizer(
                     instruction, padding="max_length"
-                )["input_ids"]).to(context.device)
+                )["input_ids"]).to(context_feats.device)
                 with torch.no_grad():
                     instruction = self._lang_model(tokens).last_hidden_state
                     # now instruction is a tensor
@@ -127,55 +146,28 @@ class DiffuserActor(nn.Module):
             )
 
         # Encode gripper history (B, nhist, F)
-        adaln_gripper_feats, _ = self.encoder.encode_curr_gripper(
-            curr_gripper, context_feats, context
+        adaln_gripper_feats = self.curr_gripper_feat(curr_gripper[..., :9])
+
+        return (
+            context_feats,  # contextualized visual features
+            instr_feats,  # language features
+            adaln_gripper_feats  # gripper history features
         )
-        if not return_sampled_inds:
-            # FPS on visual features (N, B, F) and (B, N, F, 2)
-            fps_feats, fps_pos = self.encoder.run_fps(
-                context_feats.transpose(0, 1),
-                self.encoder.relative_pe_layer(context)
-            )
-            return (
-                context_feats, context,  # contextualized visual features
-                instr_feats,  # language features
-                adaln_gripper_feats,  # gripper history features
-                fps_feats, fps_pos  # sampled visual features
-            )
-        else:
-            # FPS on visual features (N, B, F) and (B, N, F, 2)
-            fps_feats, fps_pos, sampled_inds = self.encoder.run_fps(
-                context_feats.transpose(0, 1),
-                self.encoder.relative_pe_layer(context),
-                return_sampled_inds=True
-            )
-            return (
-                context_feats, context,  # contextualized visual features
-                instr_feats,  # language features
-                adaln_gripper_feats,  # gripper history features
-                fps_feats, fps_pos  # sampled visual features
-            ), sampled_inds # return sampled_inds (B, N)
 
     def policy_forward_pass(self, trajectory, timestep, fixed_inputs, distillation_mode=False):
         # Parse inputs
         (
             context_feats,
-            context,
             instr_feats,
             adaln_gripper_feats,
-            fps_feats,
-            fps_pos
         ) = fixed_inputs
 
         return self.prediction_head(
             trajectory,
             timestep,
             context_feats=context_feats,
-            context=context,
             instr_feats=instr_feats,
             adaln_gripper_feats=adaln_gripper_feats,
-            fps_feats=fps_feats,
-            fps_pos=fps_pos,
             distillation_mode=distillation_mode
         )
 
@@ -245,7 +237,7 @@ class DiffuserActor(nn.Module):
         # Prepare inputs
         fixed_inputs = self.encode_inputs(
             rgb_obs, pcd_obs, instruction, curr_gripper
-        ) 
+        )
 
         # Condition on start-end pose
         B, nhist, D = curr_gripper.shape
@@ -345,7 +337,8 @@ class DiffuserActor(nn.Module):
         instruction,
         curr_gripper,
         run_inference=False,
-        distillation_mode=False
+        distillation_mode=False,
+        distillation_related_inputs=None
     ):
         """
         Arguments:
@@ -392,29 +385,28 @@ class DiffuserActor(nn.Module):
         curr_gripper = self.convert_rot(curr_gripper)
 
         # Prepare inputs
-        if not distillation_mode:
-            fixed_inputs = self.encode_inputs(
-                rgb_obs, pcd_obs, instruction, curr_gripper
-            )
-        else:
-            fixed_inputs, sampled_inds = self.encode_inputs(
-                rgb_obs, pcd_obs, instruction, curr_gripper, return_sampled_inds=True
-            )
+        fixed_inputs = self.encode_inputs(
+            rgb_obs, pcd_obs, instruction, curr_gripper
+        )
 
         # Condition on start-end pose
         cond_data = torch.zeros_like(gt_trajectory)
         cond_mask = torch.zeros_like(cond_data)
         cond_mask = cond_mask.bool()
 
-        # Sample noise
-        noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
+        if distillation_mode:
+            noise = distillation_related_inputs["noise"]
+            timesteps = distillation_related_inputs["timesteps"]
+        else:
+            # Sample noise
+            noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
 
-        # Sample a random timestep
-        timesteps = torch.randint(
-            0,
-            self.position_noise_scheduler.config.num_train_timesteps,
-            (len(noise),), device=noise.device
-        ).long()
+            # Sample a random timestep
+            timesteps = torch.randint(
+                0,
+                self.position_noise_scheduler.config.num_train_timesteps,
+                (len(noise),), device=noise.device
+            ).long()
 
         # Add noise to the clean trajectories
         pos = self.position_noise_scheduler.add_noise(
@@ -452,10 +444,103 @@ class DiffuserActor(nn.Module):
                 openess = layer_pred[..., 9:]
                 loss += F.l1_loss(openess, gt_openess)
             total_loss = total_loss + loss
-        if not distillation_mode:
-            return total_loss
+        
+        # Distillation loss
+        if distillation_mode:
+            teacher_pred = distillation_related_inputs["pred"]
+            teacher_gripper_features_all_layers = distillation_related_inputs["gripper_features_all_layers"] # a list of 2 (19, B, 192) tensors
+            teacher_features_all_layers = distillation_related_inputs["features_all_layers"] # a list of 4 (1043, B, 192) tensors
+            teacher_sampled_inds = distillation_related_inputs["sampled_inds"] # (B, 1024), values in between (0, 1024*num_cam)
+            cam_index_for_2d_policy = distillation_related_inputs["cam_index_for_2d_policy"]
+
+            gripper_feature_num_tokens = gripper_features_all_layers[0].shape[0] # 19
+            features_num_tokens = features_all_layers[0].shape[0] # 1043
+            context_feature_num_tokens = features_num_tokens - gripper_feature_num_tokens # 1024
+            teacher_gripper_feature_num_tokens = teacher_gripper_features_all_layers[0].shape[0] # 19
+            teacher_features_num_tokens = teacher_features_all_layers[0].shape[0] # 1043
+            teacher_context_feature_num_tokens = teacher_features_num_tokens - teacher_gripper_feature_num_tokens # 1024 (after fps, subsamped from 1024*num_cam)
+            assert gripper_feature_num_tokens == teacher_gripper_feature_num_tokens
+            
+            
+            # Compute distillation loss
+            # final prediction:
+            pred_l2_loss = F.mse_loss(pred[-1], teacher_pred[-1])
+            # intermediate layers:
+            assert len(teacher_gripper_features_all_layers) == len(gripper_features_all_layers)
+            assert len(teacher_features_all_layers) == len(features_all_layers)
+            gripper_features_l2_loss_part1 = 0
+            for i in range(len(teacher_gripper_features_all_layers)):
+                gripper_features_l2_loss_part1 += F.mse_loss(gripper_features_all_layers[i], teacher_gripper_features_all_layers[i])
+            gripper_features_l2_loss_part2 = 0
+            for i in range(len(teacher_features_all_layers)):
+                gripper_features_l2_loss_part2 += F.mse_loss(features_all_layers[i][:gripper_feature_num_tokens], teacher_features_all_layers[i][:gripper_feature_num_tokens])
+            context_feature_loss = 0
+            for i in range(len(teacher_features_all_layers)):
+                # Define the range of the indices for the context features that are relevant for the 2D policy
+                start_idx = context_feature_num_tokens * cam_index_for_2d_policy
+                end_idx = context_feature_num_tokens * (cam_index_for_2d_policy + 1) - 1
+
+                # Step 1: Create a mask for indices in the range
+                mask = (teacher_sampled_inds >= start_idx) & (teacher_sampled_inds <= end_idx)
+
+                # Step 2: Use mask to select relevant indices
+                batch_size = teacher_sampled_inds.shape[0]
+                selected_features_list = []
+                selected_teacher_features_list = []
+
+                for b in range(batch_size):
+                    # Masked indices for current batch
+                    mask_b = mask[b]
+                    sampled_inds_b = teacher_sampled_inds[b]
+                    
+                    # Get the indices to select
+                    indices_to_select = sampled_inds_b[mask_b]
+
+                    if indices_to_select.numel() == 0:
+                        # If no indices are selected, skip this batch
+                        continue
+                    
+                    # Calculate the adjusted indices for features
+                    adjusted_indices = indices_to_select - start_idx
+
+                    # Select relevant columns from features
+                    selected_feats = features_all_layers[i][adjusted_indices + gripper_feature_num_tokens, b, :] # (num_selected_indices, F)
+
+                    # Select relevant columns from teacher_features
+                    selected_teacher_feats = teacher_features_all_layers[i][mask_b.nonzero(as_tuple=True)[0] + gripper_feature_num_tokens, b, :]
+
+                    selected_features_list.append(selected_feats)
+                    selected_teacher_features_list.append(selected_teacher_feats)
+
+                # Concatenate the results
+                if selected_features_list:
+                    selected_features = torch.cat(selected_features_list) # (num_selected_indices * batch_size, F)
+                    selected_teacher_features = torch.cat(selected_teacher_features_list)
+                else:
+                    # Handle the case where no indices were selected
+                    raise ValueError("No indices were selected in any batch.")
+
+                # Ensure that both tensors have the same shape before computing MSE
+                assert selected_features.shape == selected_teacher_features.shape, \
+                    "Shape mismatch between selected features and teacher features."
+
+                # Step 3: Compute MSE loss
+                context_feature_loss += F.mse_loss(selected_features, selected_teacher_features)
+
+            # details
+            detailed_loss = {
+                "target_loss": total_loss,
+                "pred_l2_loss": pred_l2_loss,
+                "gripper_features_l2_loss_part1": gripper_features_l2_loss_part1,
+                "gripper_features_l2_loss_part2": gripper_features_l2_loss_part2,
+                "context_feature_loss": context_feature_loss
+            }
+            
+            total_loss += pred_l2_loss + gripper_features_l2_loss_part1 + gripper_features_l2_loss_part2 + context_feature_loss
+            return total_loss, detailed_loss
+        
         else:
-            return total_loss, sampled_inds, noise, timesteps, pred, gripper_features_all_layers, features_all_layers
+            return total_loss
 
 
 class DiffusionHead(nn.Module):
@@ -561,18 +646,14 @@ class DiffusionHead(nn.Module):
         )
 
     def forward(self, trajectory, timestep,
-                context_feats, context, instr_feats, adaln_gripper_feats,
-                fps_feats, fps_pos, distillation_mode=False):
+                context_feats, instr_feats, adaln_gripper_feats, distillation_mode=False):
         """
         Arguments:
             trajectory: (B, trajectory_length, 3+6+X)
             timestep: (B, 1)
             context_feats: (B, N, F)
-            context: (B, N, F, 2)
             instr_feats: (B, max_instruction_length, F)
             adaln_gripper_feats: (B, nhist, F)
-            fps_feats: (N, B, F), N < context_feats.size(1)
-            fps_pos: (B, N, F, 2)
         """
         # Trajectory features
         traj_feats = self.traj_encoder(trajectory)  # (B, L, F)
@@ -598,29 +679,26 @@ class DiffusionHead(nn.Module):
         )
         if not distillation_mode:
             pos_pred, rot_pred, openess_pred = self.prediction_head(
-                trajectory[..., :3], traj_feats,
-                context[..., :3], context_feats,
+                traj_feats,
+                context_feats,
                 timestep, adaln_gripper_feats,
-                fps_feats, fps_pos,
                 instr_feats
             )
             return [torch.cat((pos_pred, rot_pred, openess_pred), -1)]
         else:
             pos_pred, rot_pred, openess_pred, gripper_features_all_layers, features_all_layers = self.prediction_head(
-                trajectory[..., :3], traj_feats,
-                context[..., :3], context_feats,
+                traj_feats,
+                context_feats,
                 timestep, adaln_gripper_feats,
-                fps_feats, fps_pos,
                 instr_feats,
                 return_all_layers=True
             )
             return [torch.cat((pos_pred, rot_pred, openess_pred), -1)], gripper_features_all_layers, features_all_layers
 
     def prediction_head(self,
-                        gripper_pcd, gripper_features,
-                        context_pcd, context_features,
+                        gripper_features,
+                        context_features,
                         timesteps, curr_gripper_features,
-                        sampled_context_features, sampled_rel_context_pos,
                         instr_feats, return_all_layers=False):
         """
         Compute the predicted action (position, rotation, opening).
@@ -641,48 +719,44 @@ class DiffusionHead(nn.Module):
             timesteps, curr_gripper_features
         )
 
-        # Positional embeddings
-        rel_gripper_pos = self.relative_pe_layer(gripper_pcd)
-        rel_context_pos = self.relative_pe_layer(context_pcd)
-
         # Cross attention from gripper to full context
         gripper_features = self.cross_attn(
             query=gripper_features,
             value=context_features,
-            query_pos=rel_gripper_pos,
-            value_pos=rel_context_pos,
+            query_pos=None,
+            value_pos=None,
             diff_ts=time_embs
         )
         gripper_features_all_layers = gripper_features
-        gripper_features = gripper_features[-1] # (N, B, F)
+        gripper_features = gripper_features[-1]
 
         # Self attention among gripper and sampled context
-        features = torch.cat([gripper_features, sampled_context_features], 0)
-        rel_pos = torch.cat([rel_gripper_pos, sampled_rel_context_pos], 1)
+        features = torch.cat([gripper_features, context_features], 0)
         features = self.self_attn(
             query=features,
-            query_pos=rel_pos,
+            query_pos=None,
             diff_ts=time_embs,
             context=instr_feats,
             context_pos=None
         )
         features_all_layers = features
         features = features[-1]
-        
+
         num_gripper = gripper_features.shape[0]
 
         # Rotation head
         rotation = self.predict_rot(
-            features, rel_pos, time_embs, num_gripper, instr_feats
+            features, time_embs, num_gripper, instr_feats
         )
 
         # Position head
         position, position_features = self.predict_pos(
-            features, rel_pos, time_embs, num_gripper, instr_feats
+            features, time_embs, num_gripper, instr_feats
         )
 
         # Openess head from position head
         openess = self.openess_predictor(position_features)
+
         if not return_all_layers:
             return position, rotation, openess
         else:
@@ -707,11 +781,11 @@ class DiffusionHead(nn.Module):
         curr_gripper_feats = self.curr_gripper_emb(curr_gripper_features)
         return time_feats + curr_gripper_feats
 
-    def predict_pos(self, features, rel_pos, time_embs, num_gripper,
+    def predict_pos(self, features, time_embs, num_gripper,
                     instr_feats):
         position_features = self.position_self_attn(
             query=features,
-            query_pos=rel_pos,
+            query_pos=None,
             diff_ts=time_embs,
             context=instr_feats,
             context_pos=None
@@ -723,11 +797,11 @@ class DiffusionHead(nn.Module):
         position = self.position_predictor(position_features)
         return position, position_features
 
-    def predict_rot(self, features, rel_pos, time_embs, num_gripper,
+    def predict_rot(self, features, time_embs, num_gripper,
                     instr_feats):
         rotation_features = self.rotation_self_attn(
             query=features,
-            query_pos=rel_pos,
+            query_pos=None,
             diff_ts=time_embs,
             context=instr_feats,
             context_pos=None
