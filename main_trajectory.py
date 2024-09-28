@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 
-# from datasets.dataset_engine import RLBenchDataset
+from datasets.dataset_engine import RLBenchDataset
 from engine import BaseTrainTester
 from diffuser_actor import DiffuserActor
 
